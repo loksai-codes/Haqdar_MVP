@@ -1,0 +1,6 @@
+{
+  "name": "Haqdar - Graph-Powered AI Welfare Benefit Navigator",
+  "description": "AI-powered welfare navigator built for Indian citizens using FalkorDB openCypher knowledge graph and multi-agent reasoning in Hindi, Telugu, and English.",
+  "requestFramePermissions": ["geolocation", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
