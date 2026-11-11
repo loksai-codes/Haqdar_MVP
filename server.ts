@@ -1,10 +1,11 @@
-import express, { Request, Response } from 'express';
+import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { createServer as createViteServer } from 'vite';
 import { initFalkorDB, execute_falkordb_cypher, getGraphTopology } from './server/falkordb-service.ts';
-import { performHaqdarReasoning, CitizenProfile } from './server/agent-reasoning.ts';
+import { performHaqdarReasoning } from './server/agent-reasoning.ts';
+import type { CitizenProfile } from './server/agent-reasoning.ts';
 import { parseCitizenIntake } from './server/intake-agent.ts';
 
 dotenv.config({ path: '.env.local' });
@@ -12,12 +13,24 @@ dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const PORT = parseInt(process.env.PORT || '3000', 10);
+const PORT = parseInt(process.env.PORT || '8080', 10);
 const isProduction = process.env.NODE_ENV === 'production';
 
 async function bootstrap() {
   const app = express();
-  app.use(express.json());
+  app.disable('x-powered-by');
+  app.use(express.json({ limit: '1mb' }));
+
+  // CORS and security headers for API routes
+  app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
 
   // Initialize FalkorDB connection in background
   initFalkorDB().catch(err => {
@@ -34,6 +47,10 @@ async function bootstrap() {
     res.json({
       status: 'ok',
       engine: 'Haqdar Multi-Agent Reasoning Core',
+      environment: isProduction ? 'production' : 'development',
+      groq: {
+        configured: Boolean(process.env.GROQ_API_KEY)
+      },
       falkordb: {
         host: topology.meta.cloudHost,
         connected: topology.meta.connectedCloud,
@@ -54,7 +71,7 @@ async function bootstrap() {
       const result = await parseCitizenIntake(text, language || 'en');
       res.json(result);
     } catch (err: any) {
-      console.error('[API /api/intake/parse] error:', err);
+      console.error('[API /api/intake/parse] error:', err?.message || 'Unknown error');
       res.status(500).json({ error: err.message || 'Intake parsing failed' });
     }
   });
@@ -70,7 +87,7 @@ async function bootstrap() {
       const result = await performHaqdarReasoning(profile);
       res.json(result);
     } catch (err: any) {
-      console.error('[API /api/graph/reason] error:', err);
+      console.error('[API /api/graph/reason] error:', err?.message || 'Unknown error');
       res.status(500).json({ error: err.message || 'Graph reasoning failed' });
     }
   });
@@ -86,7 +103,7 @@ async function bootstrap() {
       const result = await execute_falkordb_cypher(query, params || {});
       res.json(result);
     } catch (err: any) {
-      console.error('[API /api/graph/cypher] error:', err);
+      console.error('[API /api/graph/cypher] error:', err?.message || 'Unknown error');
       res.status(500).json({ error: err.message || 'Cypher query execution failed' });
     }
   });
@@ -96,23 +113,46 @@ async function bootstrap() {
     res.json(getGraphTopology());
   });
 
-  // Mount Vite or static server
+  // Ensure unmatched API routes return JSON 404 rather than SPA HTML
+  app.all('/api/*', (req: Request, res: Response) => {
+    res.status(404).json({ error: 'API route not found' });
+  });
+
+  // Mount Vite (development only) or static production server
   if (!isProduction) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
+    const distDir = path.resolve(__dirname, 'dist');
+    app.use(express.static(distDir));
     app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
+      res.sendFile(path.resolve(distDir, 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Haqdar Core] Server running on http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Haqdar Core] Server running on http://0.0.0.0:${PORT} (${isProduction ? 'production' : 'development'})`);
   });
+
+  // Reasonable HTTP timeouts for Cloud Run
+  server.requestTimeout = 30000;
+  server.headersTimeout = 35000;
+  server.keepAliveTimeout = 65000;
+
+  const shutdown = (signal: string) => {
+    console.log(`[Haqdar Core] Received ${signal}, shutting down gracefully...`);
+    server.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 5000).unref();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 bootstrap().catch(err => {

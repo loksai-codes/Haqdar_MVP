@@ -4,11 +4,13 @@ import dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 dotenv.config();
 
-const FALKORDB_HOST = process.env.FALKORDB_HOST || 'r-6jissuruar.instance-8wejxcrnr.hc-7up0crkyn.ap-south-1.aws.f2e0a955bb84.cloud';
+const FALKORDB_HOST = process.env.FALKORDB_HOST || '';
 const FALKORDB_PORT = parseInt(process.env.FALKORDB_PORT || '53834', 10);
 const FALKORDB_USERNAME = process.env.FALKORDB_USERNAME || 'falkordb';
-const FALKORDB_PASSWORD = process.env.FALKORDB_PASSWORD || 'password';
+const FALKORDB_PASSWORD = process.env.FALKORDB_PASSWORD || '';
 const GRAPH_NAME = 'haqdar_welfare';
+const RECONNECT_COOLDOWN_MS = 30000;
+const FALKORDB_CONNECT_TIMEOUT_MS = 8000;
 
 let client: any = null;
 let graph: any = null;
@@ -424,16 +426,26 @@ export const memoryEngine = new MemoryGraphEngine();
 // Connect to FalkorDB Cloud with resilience
 export async function initFalkorDB(): Promise<boolean> {
   if (isConnected && graph) return true;
+  if (!FALKORDB_HOST || !FALKORDB_PASSWORD) {
+    console.warn('[FalkorDB] FALKORDB_HOST or FALKORDB_PASSWORD is not configured. Using built-in memory engine.');
+    isConnected = false;
+    return false;
+  }
   lastConnectionAttempt = Date.now();
 
   try {
     console.log(`[FalkorDB] Connecting to ${FALKORDB_HOST}:${FALKORDB_PORT}...`);
-    client = await FalkorDB.connect({
-      host: FALKORDB_HOST,
-      port: FALKORDB_PORT,
-      username: FALKORDB_USERNAME,
-      password: FALKORDB_PASSWORD
-    });
+    client = await Promise.race([
+      FalkorDB.connect({
+        host: FALKORDB_HOST,
+        port: FALKORDB_PORT,
+        username: FALKORDB_USERNAME,
+        password: FALKORDB_PASSWORD
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('FalkorDB connection timed out')), FALKORDB_CONNECT_TIMEOUT_MS)
+      )
+    ]);
 
     graph = client.selectGraph(GRAPH_NAME);
     isConnected = true;
@@ -476,6 +488,11 @@ export async function execute_falkordb_cypher(query: string, params: Record<stri
 }> {
   const startTime = Date.now();
 
+  // Attempt lazy reconnect if not connected and cooldown elapsed
+  if ((!isConnected || !graph) && FALKORDB_HOST && FALKORDB_PASSWORD && (Date.now() - lastConnectionAttempt > RECONNECT_COOLDOWN_MS)) {
+    await initFalkorDB();
+  }
+
   // Try live FalkorDB cloud if connected
   if (isConnected && graph) {
     try {
@@ -489,6 +506,7 @@ export async function execute_falkordb_cypher(query: string, params: Record<stri
       };
     } catch (cloudErr: any) {
       console.warn('[FalkorDB] Query on cloud instance error:', cloudErr.message);
+      isConnected = false;
     }
   }
 

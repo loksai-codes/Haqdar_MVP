@@ -1,39 +1,19 @@
-import { GoogleGenAI, Type } from '@google/genai';
-import { CitizenProfile } from './agent-reasoning.ts';
+import type { CitizenProfile } from './agent-reasoning.ts';
 
-let aiInstance: GoogleGenAI | null = null;
-
-function getAIClient(): GoogleGenAI | null {
-  if (aiInstance) return aiInstance;
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.warn('[Gemini] GEMINI_API_KEY is not set. Intelligent intake will use heuristic parser.');
-    return null;
-  }
-  aiInstance = new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build'
-      }
-    }
-  });
-  return aiInstance;
-}
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const GROQ_TIMEOUT_MS = 15000;
 
 // Regex to detect 12-digit Indian Aadhaar numbers or 10-char PAN numbers to redact immediately
 export function scrubGovernmentIdTokens(text: string): { cleanedText: string; idsDetected: boolean } {
-  const aadhaarRegex = /\b\d{4}\s?\d{4}\s?\d{4}\b/g;
-  const panRegex = /\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b/g;
-
-  let idsDetected = false;
-  if (aadhaarRegex.test(text) || panRegex.test(text)) {
-    idsDetected = true;
-  }
+  const aadhaarPattern = /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g;
+  const panPattern = /\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b/g;
 
   const cleanedText = text
-    .replace(aadhaarRegex, '[REDACTED_AADHAAR_REMOVED_FOR_PRIVACY]')
-    .replace(panRegex, '[REDACTED_PAN_REMOVED_FOR_PRIVACY]');
+    .replace(aadhaarPattern, '[REDACTED_AADHAAR_REMOVED_FOR_PRIVACY]')
+    .replace(panPattern, '[REDACTED_PAN_REMOVED_FOR_PRIVACY]');
+
+  const idsDetected = cleanedText !== text;
 
   return { cleanedText, idsDetected };
 }
@@ -124,6 +104,7 @@ export async function parseCitizenIntake(input: string, language: 'en' | 'te' | 
   extracted: CitizenProfile;
   privacyNotice: string;
   assistantReply: string;
+  provider?: 'groq' | 'heuristic';
 }> {
   const { cleanedText, idsDetected } = scrubGovernmentIdTokens(input);
 
@@ -142,13 +123,13 @@ export async function parseCitizenIntake(input: string, language: 'en' | 'te' | 
     ? '🛡️ Privacy Guard Activated: Detected potential Aadhaar/identity number in input. Per Haqdar privacy protocols, government identity numbers are stripped and never recorded.'
     : '🛡️ Privacy Guard Active: No Aadhaar or identity numbers stored.';
 
-  const ai = getAIClient();
-  if (!ai) {
+  const buildFallbackResult = () => {
     const heuristic = heuristicParse(cleanedText);
     const merged: CitizenProfile = {
       ...defaultProfile,
       ...heuristic,
-      held_documents: heuristic.held_documents || defaultProfile.held_documents
+      held_documents: heuristic.held_documents || defaultProfile.held_documents,
+      preferred_language: language
     };
 
     let reply = `Understood your profile: ${merged.age} years, ${merged.occupation} from ${merged.state}. Proceeding to graph reasoning.`;
@@ -161,8 +142,15 @@ export async function parseCitizenIntake(input: string, language: 'en' | 'te' | 
     return {
       extracted: merged,
       privacyNotice,
-      assistantReply: reply
+      assistantReply: reply,
+      provider: 'heuristic' as const
     };
+  };
+
+  const groqApiKey = process.env.GROQ_API_KEY;
+  if (!groqApiKey) {
+    console.warn('[Groq Intake] GROQ_API_KEY is not set. Using heuristic intake parser.');
+    return buildFallbackResult();
   }
 
   try {
@@ -170,50 +158,55 @@ export async function parseCitizenIntake(input: string, language: 'en' | 'te' | 
 You communicate fluently in Hindi, Telugu, or English.
 Your job:
 1. Parse citizen demographics from user text or transcript.
-2. Demographics required:
+2. Return ONLY a valid JSON object with these exact keys:
    - state (string, default "Telangana")
-   - age (number, between 18 and 100)
+   - age (integer, between 18 and 100)
    - gender ("female", "male", or "other")
    - marital_status ("single", "married", "widow", "divorced")
-   - occupation (string, e.g. "farmer", "agricultural labourer", "weaver", "artisan", "daily wage worker", "homemaker")
+   - occupation (string, e.g. "farmer", "agricultural labourer", "artisan", "daily wage worker", "homemaker", "self-employed")
    - annual_income (number in INR)
-   - held_documents (array of strings, chosen from: "Aadhaar Card", "Food Security Card (Ration Card)", "Spouse Death Certificate", "Income Certificate", "Pattadar Passbook (Land Title)", "Bank Passbook", "Community / Caste Certificate")
-3. CRITICAL PRIVACY RULE: NEVER extract or output Aadhaar numbers or government identity tokens.
-4. Provide a warm, empathetic 1-2 sentence assistant reply in the citizen's preferred language (${language}).`;
+   - held_documents (array of strings, chosen ONLY from: "Aadhaar Card", "Food Security Card (Ration Card)", "Spouse Death Certificate", "Income Certificate", "Pattadar Passbook (Land Title)", "Bank Passbook", "Community / Caste Certificate")
+   - assistant_reply (warm, empathetic 1-2 sentence reply in the citizen's preferred language: "${language}")
+3. CRITICAL PRIVACY RULE: NEVER extract or output Aadhaar numbers, PAN numbers, or government identity tokens.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: `Citizen statement: "${cleanedText}". Preferred language: ${language}. Extract profile JSON.`,
-      config: {
-        systemInstruction: systemPrompt,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            state: { type: Type.STRING },
-            age: { type: Type.INTEGER },
-            gender: { type: Type.STRING },
-            marital_status: { type: Type.STRING },
-            occupation: { type: Type.STRING },
-            annual_income: { type: Type.NUMBER },
-            held_documents: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            },
-            assistant_reply: { type: Type.STRING }
-          },
-          required: ['state', 'age', 'gender', 'marital_status', 'occupation', 'annual_income', 'held_documents', 'assistant_reply']
-        }
-      }
+    const response = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${groqApiKey}`
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Citizen statement: "${cleanedText}". Preferred language: ${language}. Extract profile JSON.` }
+        ]
+      }),
+      signal: AbortSignal.timeout(GROQ_TIMEOUT_MS)
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    if (!response.ok) {
+      throw new Error(`Groq API returned HTTP ${response.status}`);
+    }
+
+    const payload: any = await response.json();
+    const rawContent = payload?.choices?.[0]?.message?.content;
+    if (!rawContent) {
+      throw new Error('Empty completion content from Groq API');
+    }
+
+    const parsed = JSON.parse(rawContent);
+
+    const allowedGenders = ['female', 'male', 'other'];
+    const normalizedGender = typeof parsed.gender === 'string' ? parsed.gender.toLowerCase() : '';
 
     const resultProfile: CitizenProfile = {
       state: parsed.state || defaultProfile.state,
       age: Number(parsed.age) || defaultProfile.age,
-      gender: (parsed.gender?.toLowerCase() === 'male' || parsed.gender?.toLowerCase() === 'female') ? parsed.gender.toLowerCase() : defaultProfile.gender,
-      marital_status: parsed.marital_status?.toLowerCase() || defaultProfile.marital_status,
+      gender: allowedGenders.includes(normalizedGender) ? normalizedGender : defaultProfile.gender,
+      marital_status: typeof parsed.marital_status === 'string' ? parsed.marital_status.toLowerCase() : defaultProfile.marital_status,
       occupation: parsed.occupation || defaultProfile.occupation,
       annual_income: Number(parsed.annual_income) || defaultProfile.annual_income,
       held_documents: Array.isArray(parsed.held_documents) && parsed.held_documents.length > 0 ? parsed.held_documents : defaultProfile.held_documents,
@@ -223,15 +216,11 @@ Your job:
     return {
       extracted: resultProfile,
       privacyNotice,
-      assistantReply: parsed.assistant_reply || 'Profile processed successfully.'
+      assistantReply: parsed.assistant_reply || 'Profile processed successfully.',
+      provider: 'groq'
     };
   } catch (err: any) {
-    console.warn('[Gemini Intake] Error parsing content:', err.message);
-    const heuristic = heuristicParse(cleanedText);
-    return {
-      extracted: { ...defaultProfile, ...heuristic },
-      privacyNotice,
-      assistantReply: 'Information recorded and analyzed.'
-    };
+    console.warn('[Groq Intake] Falling back to heuristic parser:', err?.message || 'Unknown error');
+    return buildFallbackResult();
   }
 }
